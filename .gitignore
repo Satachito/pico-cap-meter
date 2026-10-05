@@ -1,0 +1,12 @@
+# ビルドの出力
+build/
+build-*/
+mac/.build/
+mac/CapMeter.app/
+
+# 撮影したままの写真 (位置情報入り)。公開用は images/ にメタデータを消して置く
+Shots/
+
+# macOS / 個人設定
+.DS_Store
+.claude/settings.local.json

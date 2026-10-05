@@ -1,0 +1,35 @@
+; 低容量レンジ用の充電時間カウンタ
+;   set pin : GP21 (1MΩ 経由で充電)
+;   jmp pin : GP26 (コンデンサ電圧, シュミット入力)
+;
+; TX FIFO にタイムアウト値を入れると充電を開始し、GP26 が HIGH になった時点の
+; 残りカウント x を RX FIFO に返す。1 ループ 2 サイクルなので
+;   経過サイクル = 2 * (timeout - x)
+; タイムアウト時は x = 0xFFFFFFFF が返る。
+
+.program cap_timer
+.wrap_target
+    pull block          ; タイムアウト値を受け取る
+    mov x, osr
+    set pins, 1         ; 充電開始
+loop:
+    jmp pin done        ; しきい値を超えた
+    jmp x-- loop
+done:
+    set pins, 0         ; 充電停止
+    mov isr, x
+    push block
+.wrap
+
+% c-sdk {
+static inline void cap_timer_program_init(PIO pio, uint sm, uint offset, uint charge_pin, uint sense_pin) {
+    pio_sm_config c = cap_timer_program_get_default_config(offset);
+    sm_config_set_set_pins(&c, charge_pin, 1);
+    sm_config_set_jmp_pin(&c, sense_pin);
+    pio_sm_init(pio, sm, offset, &c);
+    // ピン機能を PIO に切り替えた瞬間に LOW 出力になるよう、先に状態を決めておく
+    pio_sm_set_pins_with_mask(pio, sm, 0, 1u << charge_pin);
+    pio_sm_set_pindirs_with_mask(pio, sm, 1u << charge_pin, 1u << charge_pin);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
