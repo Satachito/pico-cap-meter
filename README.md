@@ -4,6 +4,20 @@ Raspberry Pi Pico と抵抗 2 本で作るコンデンサ容量計です。数 p
 
 ![初代 Pico (Pico H) と 25 穴ブレッドボード](images/pico.jpg)
 
+## ダウンロード
+
+[Releases](https://github.com/Satachito/pico-cap-meter/releases/latest) から、使うボード用のファームウェアと Mac アプリをダウンロードしてください。
+
+| ファイル | 内容 |
+| --- | --- |
+| `cap_meter-pico.uf2` | 初代 Pico (RP2040) 用のファームウェア |
+| `cap_meter-pico2.uf2` | Pico 2 (RP2350) 用のファームウェア |
+| `CapMeter-mac.zip` | Mac アプリ (macOS 14 以降、Apple シリコン / Intel) |
+
+1. BOOTSEL ボタンを押しながら Pico を USB でつなぎ、出てきたドライブ (Pico は `RPI-RP2`、Pico 2 は `RP2350`) に UF2 をドラッグします。
+2. `CapMeter-mac.zip` を展開して `CapMeter.app` を開きます。Apple の公証を受けていないので、初回は開けないという警告が出ます。システム設定の「プライバシーとセキュリティ」で「このまま開く」を選んでください。
+3. アプリの「次にやること」に従って、ゼロ点 → しきい値 → レンジ間の順に校正します。
+
 ## 回路
 
 ```
