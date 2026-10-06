@@ -10,3 +10,4 @@ Shots/
 # macOS / 個人設定
 .DS_Store
 .claude/settings.local.json
+.claude/launch.json

@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>コンデンサ容量計</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="bar">
+  <span id="dot" class="dot"></span>
+  <span id="port-label" class="port-label">未接続</span>
+  <button id="connect" class="primary">Pico に接続</button>
+  <span class="spacer"></span>
+  <span class="muted">レンジ</span>
+  <div id="mode" class="segmented" role="radiogroup" aria-label="レンジ">
+    <button data-mode="auto" role="radio">自動</button>
+    <button data-mode="lo" role="radio">低容量 (1MΩ)</button>
+    <button data-mode="hi" role="radio">高容量 (10kΩ)</button>
+  </div>
+</header>
+
+<main>
+  <div id="unsupported" class="card warn" hidden>
+    <strong>このブラウザでは使えません。</strong>
+    Web Serial に対応した Chrome か Edge (パソコン版) で開いてください。Safari と Firefox は対応していません。
+  </div>
+
+  <section id="guidance" class="card guidance">
+    <div id="result" class="result" hidden></div>
+    <div class="guide-row">
+      <div id="guide-icon" class="guide-icon"></div>
+      <div class="guide-text">
+        <div class="caption">次にやること</div>
+        <h2 id="guide-title"></h2>
+        <p id="guide-detail" class="muted pre"></p>
+      </div>
+      <button id="guide-action" class="primary large" hidden></button>
+    </div>
+  </section>
+
+  <div class="columns">
+    <div class="column">
+      <!-- 左は「測る」 -->
+      <section class="card">
+        <div class="caption">測定値</div>
+        <div class="reading"><span id="reading-number">—</span><span id="reading-unit"></span></div>
+        <div class="reading-sub">
+          <span id="reading-range" class="muted"></span>
+          <span id="reading-stable"></span>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="caption">今やっていること</div>
+        <div class="activity-head">
+          <span id="activity-title" class="bold"></span>
+          <span id="activity-elapsed" class="muted"></span>
+        </div>
+        <p id="activity-detail" class="muted small"></p>
+        <div id="voltage" class="voltage" hidden>
+          <div class="meter"><div id="voltage-bar"></div></div>
+          <span id="voltage-text" class="mono"></span>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="caption">最近の測定値</div>
+        <svg id="chart" class="chart" viewBox="0 0 400 160" preserveAspectRatio="none" role="img" aria-label="最近の測定値"></svg>
+        <div id="chart-axis" class="chart-axis muted small"></div>
+      </section>
+    </div>
+
+    <div class="column">
+      <!-- 右は「整える」 -->
+      <section class="card">
+        <div class="caption">校正</div>
+        <div id="steps"></div>
+        <p class="muted small">校正値は Pico のフラッシュに保存され、電源を切っても消えません。</p>
+      </section>
+
+      <section class="card">
+        <div class="caption">抵抗値</div>
+        <p id="resistor-source" class="muted"></p>
+        <hr>
+        <div class="bold">テスターで測った値を入れる</div>
+        <p class="muted small">変えると、レンジ間校正はやり直しになります。</p>
+        <label class="field">1MΩ 側 (GP21)<input id="r-lo" inputmode="decimal" autocomplete="off"><span class="unit">kΩ</span></label>
+        <label class="field">10kΩ 側 (GP22)<input id="r-hi" inputmode="decimal" autocomplete="off"><span class="unit">kΩ</span></label>
+        <div class="row">
+          <span id="r-problem" class="problem small"></span>
+          <button id="r-save">保存</button>
+        </div>
+        <hr>
+        <div class="bold">基準コンデンサで決める</div>
+        <p class="muted small">値の分かっているコンデンサ (C0G / PP フィルム / ポリスチレンの ±1% など) を挿して、その値を入れます。</p>
+        <label class="field">基準コンデンサの値<input id="ref-value" inputmode="decimal" autocomplete="off"><span class="unit">nF</span></label>
+        <div class="row">
+          <span id="ref-reason" class="small"></span>
+          <button id="ref-run">校正</button>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <details class="card">
+    <summary>シリアルの生ログ</summary>
+    <pre id="log" class="log"></pre>
+  </details>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

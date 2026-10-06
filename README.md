@@ -1,12 +1,15 @@
 # pico-cap-meter
 
-Raspberry Pi Pico と抵抗 2 本で作るコンデンサ容量計です。数 pF から数百 µF まで、自動でレンジを切り替えて測ります。測定値と「今やっていること」「次にやること」を表示する Mac アプリ付きです。
+Raspberry Pi Pico と抵抗 2 本で作るコンデンサ容量計です。数 pF から数百 µF まで、自動でレンジを切り替えて測ります。測定値と「今やっていること」「次にやること」を表示するアプリは、ブラウザ版 (Windows / Mac / Linux) と Mac アプリの 2 種類があります。
 
 ![初代 Pico (Pico H) と 25 穴ブレッドボード](images/pico.jpg)
 
 ## ダウンロード
 
-[Releases](https://github.com/Satachito/pico-cap-meter/releases/latest) から、使うボード用のファームウェアと Mac アプリをダウンロードしてください。
+[Releases](https://github.com/Satachito/pico-cap-meter/releases/latest) から、使うボード用のファームウェアをダウンロードしてください。アプリは、インストール不要のブラウザ版か、Mac アプリのどちらかを使います。
+
+**ブラウザ版: https://satachito.github.io/pico-cap-meter/**
+(Windows / Mac / Linux の Chrome か Edge で開きます。Safari と Firefox は Web Serial に対応していないので使えません)
 
 | ファイル | 内容 |
 | --- | --- |
@@ -15,7 +18,10 @@ Raspberry Pi Pico と抵抗 2 本で作るコンデンサ容量計です。数 p
 | `CapMeter-mac.zip` | Mac アプリ (macOS 14 以降、Apple シリコン / Intel) |
 
 1. BOOTSEL ボタンを押しながら Pico を USB でつなぎ、出てきたドライブ (Pico は `RPI-RP2`、Pico 2 は `RP2350`) に UF2 をドラッグします。
-2. `CapMeter-mac.zip` を展開して `CapMeter.app` を開きます。Apple の公証を受けていないので、初回は開けないという警告が出ます。システム設定の「プライバシーとセキュリティ」で「このまま開く」を選んでください。
+2. アプリを開きます。
+    - ブラウザ版: 上の URL を Chrome か Edge で開き、「Pico に接続」を押して Pico を選びます。次からは自動でつながります。
+    - Mac アプリ: `CapMeter-mac.zip` を展開して `CapMeter.app` を開きます。Apple の公証を受けていないので、初回は開けないという警告が出ます。システム設定の「プライバシーとセキュリティ」で「このまま開く」を選んでください。
+    - 2 つのアプリで同時に同じ Pico を開かないでください (データが分かれてしまいます)。
 3. アプリの「次にやること」に従って、ゼロ点 → しきい値 → レンジ間の順に校正します。
 
 ## 回路
@@ -82,6 +88,16 @@ BOOTSEL を押しながら USB をつなぎ、`build/cap_meter.uf2` (Pico 2 は 
 校正値と抵抗値はフラッシュの最後のセクタに保存され、電源を切っても、ファームウェアを書き込み直しても残ります (保存形式が変わったときは初期化されます)。最初に `z` → `c` → `x` の順に一度ずつ実行してください。テスターの値を入れるなら最初に、基準コンデンサで校正するなら `c` のあとに行います。
 
 `#` で始まる行は Mac アプリ向けの機械可読な出力です (`#state` / `#v` / `#meas` / `#mode` / `#cal` / `#done`。詳細は [main.cpp](main.cpp) の先頭のコメント)。
+
+## ブラウザ版
+
+[web/](web/) にあります (HTML / CSS / JavaScript だけで、ビルド不要)。main に push すると GitHub Actions で GitHub Pages に公開されます。手元で試すときは:
+
+```sh
+python3 -m http.server 8765 --directory web
+```
+
+で http://localhost:8765 を Chrome で開きます。`#demo` を付けて開くと (http://localhost:8765/#demo)、Pico をつながずに画面だけを動かせます。
 
 ## Mac アプリ
 
