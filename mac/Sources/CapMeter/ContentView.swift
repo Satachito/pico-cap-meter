@@ -12,14 +12,16 @@ struct ContentView: View {
                 VStack(spacing: 16) {
                     GuidanceCard()
                     HStack(alignment: .top, spacing: 16) {
+                        // 左は「測る」、右は「整える」
                         VStack(spacing: 16) {
                             ReadingCard()
                             ActivityCard()
+                            HistoryCard()
                         }
                         .frame(maxWidth: .infinity)
                         VStack(spacing: 16) {
                             CalibrationCard()
-                            HistoryCard()
+                            ResistorCard()
                         }
                         .frame(maxWidth: .infinity)
                     }
@@ -128,6 +130,9 @@ private struct GuidanceCard: View {
                 instruction = "1nF〜1µF のコンデンサ (103 や 104 など) を挿してください。"
             case .cross:
                 instruction = "30〜250nF のフィルムコンデンサ (104 など) を挿してください。誘電吸収が少ないフィルムが向いています。"
+            case .reference:
+                // 任意の校正なので nextCalibration には出てこない
+                instruction = "抵抗値の欄から、基準コンデンサの値を入れて実行してください。"
             }
             let detail = ready.ok
                 ? "準備ができています (\(ready.reason))。ボタンを押してください。"
@@ -171,9 +176,9 @@ private struct ResultBanner: View {
 
     var body: some View {
         let (icon, color, title): (String, Color, String) = switch result.outcome {
-        case "ok": ("checkmark.seal.fill", .green, "\(result.step.title)が完了しました")
-        case "abort": ("stop.circle", .secondary, "\(result.step.title)を中断しました")
-        default: ("exclamationmark.triangle.fill", .orange, "\(result.step.title)に失敗しました")
+        case "ok": ("checkmark.seal.fill", .green, "\(result.title)が完了しました")
+        case "abort": ("stop.circle", .secondary, "\(result.title)を中断しました")
+        default: ("exclamationmark.triangle.fill", .orange, "\(result.title)に失敗しました")
         }
         HStack(spacing: 8) {
             Image(systemName: icon).foregroundStyle(color)
@@ -300,6 +305,8 @@ private struct ActivityCard: View {
             return ("slider.horizontal.3", "しきい値校正中", CalibrationStep.threshold.purpose)
         case .calCross:
             return ("arrow.left.arrow.right", "レンジ間校正中", CalibrationStep.cross.purpose)
+        case .calReference:
+            return ("star.circle", "基準コンデンサ校正中", CalibrationStep.reference.purpose)
         }
     }
 }
@@ -312,9 +319,9 @@ private struct CalibrationCard: View {
     var body: some View {
         Card(title: "校正") {
             VStack(alignment: .leading, spacing: 12) {
-                ForEach(CalibrationStep.allCases) { step in
+                ForEach(CalibrationStep.required) { step in
                     row(step)
-                    if step != CalibrationStep.allCases.last { Divider() }
+                    if step != CalibrationStep.required.last { Divider() }
                 }
                 Text("校正値は Pico のフラッシュに保存され、電源を切っても消えません。")
                     .font(.caption)
@@ -361,7 +368,150 @@ private struct CalibrationCard: View {
         case .zero: return String(format: "%.2f pF", c.strayPF)
         case .threshold: return String(format: "%.4f × VDD (%.3f V)", c.vth, c.vth * 3.3)
         case .cross: return String(format: "× %.4f", c.hiGain)
+        case .reference: return nil
         }
+    }
+}
+
+// MARK: - 抵抗値
+
+private struct ResistorCard: View {
+    @Environment(MeterModel.self) private var model
+    @State private var loText = ""
+    @State private var hiText = ""
+    @State private var referenceText = ""
+
+    var body: some View {
+        Card(title: "抵抗値") {
+            VStack(alignment: .leading, spacing: 12) {
+                Label(source, systemImage: sourceIcon)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Divider()
+                manualSection
+                Divider()
+                referenceSection
+            }
+        }
+        .onAppear {
+            fillFromDevice()
+            // macOS は最初の入力欄にカーソルを入れるので外す (起動直後のキー入力が入り込まないように)
+            DispatchQueue.main.async { NSApp.keyWindow?.makeFirstResponder(nil) }
+        }
+        .onChange(of: model.calibration?.rLo) { fillFromDevice() }
+        .onChange(of: model.calibration?.rHi) { fillFromDevice() }
+    }
+
+    /// 今の抵抗値がどこから来たか
+    private var source: String {
+        guard let c = model.calibration else { return "読み込み中" }
+        if c.isDone(.reference) { return "基準コンデンサで決めた値を使っています" }
+        if c.rLo == 1e6 && c.rHi == 10e3 { return "公称値 (1MΩ / 10kΩ) のままです" }
+        return "入力した値を使っています"
+    }
+
+    private var sourceIcon: String {
+        (model.calibration?.isDone(.reference) ?? false) ? "star.circle.fill" : "info.circle"
+    }
+
+    // MARK: テスターで測った値
+
+    private var manualSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("テスターで測った値を入れる").bold()
+            Text("変えると、レンジ間校正はやり直しになります。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            row("1MΩ 側 (GP21)", text: $loText, unit: "kΩ")
+            row("10kΩ 側 (GP22)", text: $hiText, unit: "kΩ")
+            HStack {
+                Text(manualProblem ?? " ")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                Spacer()
+                Button("保存") {
+                    guard let lo = number(loText), let hi = number(hiText) else { return }
+                    model.setResistors(lo: lo * 1e3, hi: hi * 1e3)
+                }
+                .disabled(!canSaveManual)
+            }
+        }
+    }
+
+    /// Pico に保存されている値を入力欄に入れる (保存したあとも、ここで実際の値に揃う)
+    private func fillFromDevice() {
+        guard let c = model.calibration else { return }
+        loText = format(c.rLo / 1e3)
+        hiText = format(c.rHi / 1e3)
+    }
+
+    private var manualProblem: String? {
+        guard let lo = number(loText), let hi = number(hiText) else { return "数字を入れてください" }
+        if !ResistorLimits.lo.contains(lo * 1e3) { return "1MΩ 側は 500〜2000 kΩ で入れてください" }
+        if !ResistorLimits.hi.contains(hi * 1e3) { return "10kΩ 側は 5〜20 kΩ で入れてください" }
+        return nil
+    }
+
+    private var canSaveManual: Bool {
+        guard model.connected, model.calibrating == nil, manualProblem == nil, let c = model.calibration,
+              let lo = number(loText), let hi = number(hiText) else { return false }
+        return abs(lo * 1e3 - c.rLo) >= 0.5 || abs(hi * 1e3 - c.rHi) >= 0.5
+    }
+
+    // MARK: 基準コンデンサ
+
+    private var referenceSection: some View {
+        let ready = model.referenceReadiness(value: number(referenceText).map { $0 * 1e-9 })
+        let running = model.calibrating == .reference
+        return VStack(alignment: .leading, spacing: 8) {
+            Text("基準コンデンサで決める").bold()
+            Text("値の分かっているコンデンサ (C0G / PP フィルム / ポリスチレンの ±1% など) を挿して、その値を入れます。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            row("基準コンデンサの値", text: $referenceText, unit: "nF")
+            HStack {
+                Text(running ? "実行中…" : ready.reason)
+                    .font(.caption)
+                    .foregroundStyle(ready.ok || running ? .green : .secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer()
+                if running {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Button("校正") {
+                        guard let nf = number(referenceText) else { return }
+                        model.runReference(farads: nf * 1e-9)
+                    }
+                    .disabled(!ready.ok)
+                }
+            }
+        }
+    }
+
+    // MARK: 共通
+
+    private func row(_ label: String, text: Binding<String>, unit: String) -> some View {
+        HStack {
+            Text(label)
+            Spacer()
+            TextField("", text: text)
+                .multilineTextAlignment(.trailing)
+                .monospacedDigit()
+                .frame(width: 110)
+            Text(unit).foregroundStyle(.secondary).frame(width: 24, alignment: .leading)
+        }
+    }
+
+    private func format(_ value: Double) -> String {
+        var s = String(format: "%.3f", value)
+        while s.hasSuffix("0") { s.removeLast() }
+        if s.hasSuffix(".") { s.removeLast() }
+        return s
+    }
+
+    private func number(_ text: String) -> Double? {
+        Double(text.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: ",", with: ""))
     }
 }
 
