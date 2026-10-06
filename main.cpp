@@ -25,20 +25,25 @@
 //   c: しきい値校正 (1nF〜1µF 程度のコンデンサを挿して実行)
 //   x: レンジ間校正 (30〜250nF のコンデンサを挿して実行。高容量レンジを低容量レンジに合わせる)
 //   i: 校正値表示
-// 'c' と 'z' と 'x' の結果はフラッシュに保存され、起動時に読み込まれる。
+//   R <1MΩ側 [Ω]> <10kΩ側 [Ω]>: 抵抗の実測値を設定 (例 "R 998000 9870"。レンジ間校正はやり直しになる)
+//   K <nF>: 基準コンデンサ校正 (値の分かっているコンデンサを挿して実行。抵抗値を逆算する。
+//           30nF 以上なら 10kΩ側も決まり、レンジ間校正も済む。先に z と c が必要)
+// 'c' と 'z' と 'x' の結果と抵抗値はフラッシュに保存され、起動時に読み込まれる。
 //
 // Mac アプリ (mac/) 向けに、人間向けの表示とは別に '#' で始まる機械可読な行も出す:
-//   #state,<idle|measure_lo|measure_hi|discharge|cal_zero|cal_threshold|cal_cross>  (変わったときだけ)
+//   #state,<idle|measure_lo|measure_hi|discharge|cal_zero|cal_threshold|cal_cross|cal_reference>  (変わったときだけ)
 //   #v,<電圧 [V]>                            0.25 秒以上かかる充電・放電の途中経過
 //   #meas,<lo|hi>,<容量 [F] | nan>           nan は測定範囲外
 //   #mode,<auto|lo|hi>
-//   #cal,<しきい値/VDD>,<浮遊容量 [pF]>,<高容量レンジ補正>,<済んだ校正: 1=ゼロ点 2=しきい値 4=レンジ間>
-//   #done,<z|c|x>,<ok|fail|abort>,<メッセージ>
+//   #cal,<しきい値/VDD>,<浮遊容量 [pF]>,<高容量レンジ補正>,<済んだ校正: 1=ゼロ点 2=しきい値 4=レンジ間 8=基準>,
+//        <1MΩ側 [Ω]>,<10kΩ側 [Ω]>
+//   #done,<z|c|x|R|K>,<ok|fail|abort>,<メッセージ>
 
 #include <algorithm>
 #include <cstdarg>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <optional>
 
@@ -58,9 +63,13 @@ constexpr uint PIN_CHARGE_HI = 22;  // 10kΩ
 constexpr uint PIN_SENSE = 26;      // ADC0
 constexpr uint ADC_INPUT = 0;
 
-// テスターで実測した値 (公称 1MΩ / 10kΩ)
-constexpr double R_LO = 998e3;
-constexpr double R_HI = 9.87e3;
+// 抵抗値の初期値 (公称値)。テスターで測った値を 'R' コマンド (Mac アプリの「抵抗値」) で入れると、
+// フラッシュに保存されて精度が上がる
+constexpr double R_LO_DEFAULT = 1e6;
+constexpr double R_HI_DEFAULT = 10e3;
+// 受け付ける範囲 (公称値から大きく外れる値は入力ミスとみなす)
+constexpr double R_LO_MIN = 500e3, R_LO_MAX = 2e6;
+constexpr double R_HI_MIN = 5e3, R_HI_MAX = 20e3;
 
 constexpr double LO_TIMEOUT_S = 0.2;
 constexpr double AUTO_BACK_TO_LO_F = 200e-9;  // 自動レンジで高容量から低容量に戻る容量
@@ -72,6 +81,10 @@ constexpr double STRAY_MAX_F = 200e-12;  // ゼロ点校正でこれを超えた
 constexpr double CROSS_MIN_F = 30e-9;    // これ未満は高容量レンジの点が少なく不正確
 constexpr double CROSS_MAX_F = 250e-9;   // これを超えると低容量レンジがタイムアウトする
 constexpr int CROSS_LO_COUNT = 4;
+// 基準コンデンサ校正: 受け付ける値と、挿したものとのずれの許容
+constexpr double REFERENCE_MIN_F = 1e-9;
+constexpr double REFERENCE_MAX_F = 250e-9;
+constexpr double REFERENCE_TOLERANCE = 0.2;
 constexpr int CROSS_HI_WARMUP = 10;      // 誘電吸収が落ち着くまで空測定する
 constexpr int CROSS_HI_COUNT = 10;
 constexpr uint32_t MEASURE_INTERVAL_MS = 300;
@@ -97,51 +110,39 @@ double vth_ratio = 0.5;  // シュミット立ち上がりしきい値 / VDD ('c
 // 後から 'c' でしきい値を変えても差し引く量がずれない。
 double stray_t = 0.0;
 double hi_gain = 1.0;    // 高容量レンジへの補正係数 ('x' で校正)
+double r_lo = R_LO_DEFAULT;  // GP21 の抵抗 [Ω]
+double r_hi = R_HI_DEFAULT;  // GP22 の抵抗 [Ω]
 
 // 済んだ校正の印。値が初期値と同じでも校正済みと分かるように、値とは別に持つ
 constexpr uint32_t CAL_DONE_ZERO = 1u << 0;
 constexpr uint32_t CAL_DONE_THRESHOLD = 1u << 1;
 constexpr uint32_t CAL_DONE_CROSS = 1u << 2;
-constexpr uint32_t CAL_DONE_VALID = 1u << 31;  // 印を保存するようになってからのデータ
+constexpr uint32_t CAL_DONE_REFERENCE = 1u << 3;  // 抵抗値を基準コンデンサから決めた ('R' で入れたら外れる)
 uint32_t cal_done = 0;
-
-// 印のない古いデータ用: 値が初期値と違えば校正済みとみなす
-uint32_t infer_cal_done() {
-    return (stray_t != 0.0 ? CAL_DONE_ZERO : 0) | (vth_ratio != 0.5 ? CAL_DONE_THRESHOLD : 0) |
-           (hi_gain != 1.0 ? CAL_DONE_CROSS : 0);
-}
 
 // 校正値はフラッシュ最後のセクタに保存する (UF2 を書き込み直しても消えない)
 constexpr uint32_t CAL_FLASH_OFFSET = PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE;
-constexpr uint32_t CAL_MAGIC = 0x334C4143;     // "CAL3"
-constexpr uint32_t CAL_MAGIC_V2 = 0x324C4143;  // "CAL2" (hi_gain なし。読み込みだけ対応)
+// 保存形式を変えたら番号を上げる (古い形式は読まずに初期値から校正し直す)
+constexpr uint32_t CAL_MAGIC = 0x344C4143;  // "CAL4"
 
 struct Calibration {
     uint32_t magic;
-    uint32_t done;         // CAL_DONE_* (旧データは 0)
+    uint32_t done;  // CAL_DONE_*
     double vth_ratio;
     double stray_t;
     double hi_gain;
+    double r_lo;
+    double r_hi;
     uint32_t checksum;
     uint32_t reserved2;
 };
 static_assert(sizeof(Calibration) <= FLASH_PAGE_SIZE);
 
-struct CalibrationV2 {
-    uint32_t magic;
-    uint32_t reserved;
-    double vth_ratio;
-    double stray_t;
-    uint32_t checksum;
-    uint32_t reserved2;
-};
-
 // FNV-1a (checksum より前のバイトが対象)
-template <typename T>
-uint32_t calibration_checksum(const T &cal) {
+uint32_t calibration_checksum(const Calibration &cal) {
     const auto *bytes = reinterpret_cast<const uint8_t *>(&cal);
     uint32_t h = 2166136261u;
-    for (size_t i = 0; i < offsetof(T, checksum); i++) {
+    for (size_t i = 0; i < offsetof(Calibration, checksum); i++) {
         h = (h ^ bytes[i]) * 16777619u;
     }
     return h;
@@ -150,24 +151,20 @@ uint32_t calibration_checksum(const T &cal) {
 bool plausible_vth(double r) { return r > 0.1 && r < 0.9; }
 // 抵抗の誤差 (1% 程度) なら十分収まる範囲。外れるのは接触不良などで校正に失敗したとき
 bool plausible_hi_gain(double g) { return g > 0.95 && g < 1.05; }
+bool plausible_r_lo(double r) { return r >= R_LO_MIN && r <= R_LO_MAX; }
+bool plausible_r_hi(double r) { return r >= R_HI_MIN && r <= R_HI_MAX; }
 
 void load_calibration() {
-    const auto *flash = reinterpret_cast<const uint8_t *>(XIP_BASE + CAL_FLASH_OFFSET);
-    const auto &cal = *reinterpret_cast<const Calibration *>(flash);
+    const auto &cal = *reinterpret_cast<const Calibration *>(XIP_BASE + CAL_FLASH_OFFSET);
     if (cal.magic == CAL_MAGIC && cal.checksum == calibration_checksum(cal) && plausible_vth(cal.vth_ratio)) {
         vth_ratio = cal.vth_ratio;
         stray_t = cal.stray_t;
+        if (plausible_r_lo(cal.r_lo)) r_lo = cal.r_lo;
+        if (plausible_r_hi(cal.r_hi)) r_hi = cal.r_hi;
         // 補正係数だけがおかしいときは、それだけ初期値に戻す
         if (plausible_hi_gain(cal.hi_gain)) hi_gain = cal.hi_gain;
-        cal_done = (cal.done & CAL_DONE_VALID) ? cal.done & ~CAL_DONE_VALID : infer_cal_done();
+        cal_done = cal.done;
         if (hi_gain != cal.hi_gain) cal_done &= ~CAL_DONE_CROSS;
-        return;
-    }
-    const auto &v2 = *reinterpret_cast<const CalibrationV2 *>(flash);
-    if (v2.magic == CAL_MAGIC_V2 && v2.checksum == calibration_checksum(v2) && plausible_vth(v2.vth_ratio)) {
-        vth_ratio = v2.vth_ratio;
-        stray_t = v2.stray_t;
-        cal_done = infer_cal_done();
     }
 }
 
@@ -182,7 +179,9 @@ void save_calibration() {
     cal.vth_ratio = vth_ratio;
     cal.stray_t = stray_t;
     cal.hi_gain = hi_gain;
-    cal.done = cal_done | CAL_DONE_VALID;
+    cal.r_lo = r_lo;
+    cal.r_hi = r_hi;
+    cal.done = cal_done;
     cal.checksum = calibration_checksum(cal);
 
     alignas(4) uint8_t page[FLASH_PAGE_SIZE];
@@ -199,7 +198,7 @@ void save_calibration() {
 
 // 長い待ちの途中でも USB シリアルのコマンドを拾う。拾ったら測定を中断して main で処理する。
 constexpr uint64_t COMMAND_POLL_US = 10'000;
-constexpr char COMMANDS[] = "alhzcxi?";
+constexpr char COMMANDS[] = "alhzcxiRK?";
 
 int pending_command = PICO_ERROR_TIMEOUT;
 uint64_t last_command_poll = 0;
@@ -371,7 +370,7 @@ std::optional<double> average_charge_time_lo(int n) {
 }
 
 double charge_time_to_capacitance_lo(double t) {
-    return t / (R_LO * -std::log(1.0 - vth_ratio));
+    return t / (r_lo * -std::log(1.0 - vth_ratio));
 }
 
 std::optional<double> measure_lo() {
@@ -439,12 +438,12 @@ std::optional<double> measure_hi_raw() {
     if (denom <= 0) return std::nullopt;
     const double a = (sw * swty - swt * swy) / denom;  // 1/τ [1/µs]
     if (a <= 0) return std::nullopt;
-    return 1e-6 / a / R_HI;
+    return 1e-6 / a / r_hi;
 }
 
 void report_calibration() {
-    printf("#cal,%.4f,%.2f,%.4f,%lu\n", vth_ratio, charge_time_to_capacitance_lo(stray_t) * 1e12, hi_gain,
-           static_cast<unsigned long>(cal_done));
+    printf("#cal,%.4f,%.2f,%.4f,%lu,%.0f,%.0f\n", vth_ratio, charge_time_to_capacitance_lo(stray_t) * 1e12, hi_gain,
+           static_cast<unsigned long>(cal_done), r_lo, r_hi);
 }
 
 // 校正の結果を人間向けと '#done' の両方で出す
@@ -522,60 +521,71 @@ bool wait_ms_or_command(uint32_t ms) {
     return true;
 }
 
-// 同じコンデンサを両方のレンジで測り、高容量レンジの値が低容量レンジに一致するよう hi_gain を決める
-void calibrate_cross() {
-    printf("レンジ間校正中 (約 %u 秒)...\n", unsigned((CROSS_HI_WARMUP + CROSS_HI_COUNT) * MEASURE_INTERVAL_MS / 1000 + 2));
-
-    double lo_sum = 0;
+// 校正用に低容量レンジで CROSS_LO_COUNT 回測って平均する。測れなければ理由を報告して nullopt
+std::optional<double> average_lo_for_calibration(char command, const char *name, const char *hint) {
+    double sum = 0;
     for (int i = 0; i < CROSS_LO_COUNT; i++) {
         const auto c = measure_lo();
         if (!c) {
             if (command_pending()) {
-                report_done('x', "abort", "レンジ間校正を中断しました");
+                report_done(command, "abort", "%sを中断しました", name);
             } else {
-                report_done('x', "fail", "低容量レンジで測れません (30〜250nF を挿してください)");
+                report_done(command, "fail", "低容量レンジで測れません (%s)", hint);
             }
-            return;
+            return std::nullopt;
         }
-        lo_sum += *c;
+        sum += *c;
     }
-    const double c_lo = lo_sum / CROSS_LO_COUNT;
-    if (c_lo < CROSS_MIN_F || c_lo > CROSS_MAX_F) {
-        report_done('x', "fail", "容量が範囲外です: %.3f nF (30〜250nF を挿してください)", c_lo * 1e9);
-        return;
-    }
+    return sum / CROSS_LO_COUNT;
+}
 
-    // 普段の測定と同じ間隔で充放電を繰り返し、誘電吸収が落ち着いてから平均する
-    double hi_sum = 0;
+// 校正用に高容量レンジ (補正前) で測って平均する。普段の測定と同じ間隔で充放電を繰り返し、
+// 誘電吸収が落ち着いてから平均する。測れなければ理由を報告して nullopt
+std::optional<double> average_hi_raw_for_calibration(char command, const char *name) {
+    double sum = 0;
     for (int i = 0; i < CROSS_HI_WARMUP + CROSS_HI_COUNT; i++) {
         const auto c = measure_hi_raw();
         if (!c) {
             if (command_pending()) {
-                report_done('x', "abort", "レンジ間校正を中断しました");
+                report_done(command, "abort", "%sを中断しました", name);
             } else {
-                report_done('x', "fail", "高容量レンジで測れません");
+                report_done(command, "fail", "高容量レンジで測れません");
             }
-            return;
+            return std::nullopt;
         }
-        if (i >= CROSS_HI_WARMUP) hi_sum += *c;
+        if (i >= CROSS_HI_WARMUP) sum += *c;
         discharge();
         if (!wait_ms_or_command(MEASURE_INTERVAL_MS)) {
-            report_done('x', "abort", "レンジ間校正を中断しました");
-            return;
+            report_done(command, "abort", "%sを中断しました", name);
+            return std::nullopt;
         }
     }
-    const double c_hi = hi_sum / CROSS_HI_COUNT;
+    return sum / CROSS_HI_COUNT;
+}
 
-    const double gain = c_lo / c_hi;
+// 同じコンデンサを両方のレンジで測り、高容量レンジの値が低容量レンジに一致するよう hi_gain を決める
+void calibrate_cross() {
+    printf("レンジ間校正中 (約 %u 秒)...\n", unsigned((CROSS_HI_WARMUP + CROSS_HI_COUNT) * MEASURE_INTERVAL_MS / 1000 + 2));
+
+    const auto c_lo = average_lo_for_calibration('x', "レンジ間校正", "30〜250nF を挿してください");
+    if (!c_lo) return;
+    if (*c_lo < CROSS_MIN_F || *c_lo > CROSS_MAX_F) {
+        report_done('x', "fail", "容量が範囲外です: %.3f nF (30〜250nF を挿してください)", *c_lo * 1e9);
+        return;
+    }
+    const auto c_hi = average_hi_raw_for_calibration('x', "レンジ間校正");
+    if (!c_hi) return;
+
+    const double gain = *c_lo / *c_hi;
     if (!plausible_hi_gain(gain)) {
-        report_done('x', "fail", "補正係数が大きすぎます: %.4f (低容量 %.3f nF / 高容量 %.3f nF)", gain, c_lo * 1e9,
-                    c_hi * 1e9);
+        report_done('x', "fail", "補正係数が大きすぎます: %.4f (低容量 %.3f nF / 高容量 %.3f nF)", gain, *c_lo * 1e9,
+                    *c_hi * 1e9);
         return;
     }
     hi_gain = gain;
     cal_done |= CAL_DONE_CROSS;
     save_calibration();
-    report_done('x', "ok", "低容量 %.3f nF / 高容量 %.3f nF -> 補正係数 %.4f", c_lo * 1e9, c_hi * 1e9, hi_gain);
+    report_done('x', "ok", "低容量 %.3f nF / 高容量 %.3f nF -> 補正係数 %.4f", *c_lo * 1e9, *c_hi * 1e9, hi_gain);
 }
 
 void calibrate_zero() {
@@ -599,6 +609,89 @@ void calibrate_zero() {
     report_done('z', "ok", "浮遊容量: %.2f pF", stray * 1e12);
 }
 
+// コマンド文字に続く引数を 1 行読む
+void read_argument_line(char *line, size_t size) {
+    size_t n = 0;
+    while (n < size - 1) {
+        const int c = getchar_timeout_us(200'000);
+        if (c == PICO_ERROR_TIMEOUT || c == '\r' || c == '\n') break;
+        line[n++] = static_cast<char>(c);
+    }
+    line[n] = '\0';
+}
+
+// 'R' に続く 1 行 (" 998000 9870") を読んで抵抗値を設定する
+void set_resistors() {
+    char line[64];
+    read_argument_line(line, sizeof(line));
+    char *end = nullptr;
+    const double lo = std::strtod(line, &end);
+    const double hi = std::strtod(end, &end);
+    if (!plausible_r_lo(lo) || !plausible_r_hi(hi)) {
+        report_done('R', "fail", "抵抗値が範囲外です (1MΩ側 %.0f〜%.0f kΩ / 10kΩ側 %.0f〜%.0f kΩ)", R_LO_MIN / 1e3,
+                    R_LO_MAX / 1e3, R_HI_MIN / 1e3, R_HI_MAX / 1e3);
+        return;
+    }
+    r_lo = lo;
+    r_hi = hi;
+    // 補正係数は古い抵抗値で決めたものなので、レンジ間校正はやり直しにする
+    hi_gain = 1.0;
+    cal_done &= ~(CAL_DONE_CROSS | CAL_DONE_REFERENCE);
+    save_calibration();
+    report_done('R', "ok", "抵抗値: %.1f kΩ / %.3f kΩ (レンジ間校正をやり直してください)", r_lo / 1e3, r_hi / 1e3);
+}
+
+// 'K' に続く値 [nF] の基準コンデンサを測り、測定値がその値になるよう抵抗値を逆算する。
+// 低容量レンジ (容量 ∝ 1 / r_lo) から r_lo を、30nF 以上なら高容量レンジから r_hi も決める
+void calibrate_reference() {
+    char line[32];
+    read_argument_line(line, sizeof(line));
+    const double ref = std::strtod(line, nullptr) * 1e-9;
+    if (!(cal_done & CAL_DONE_ZERO) || !(cal_done & CAL_DONE_THRESHOLD)) {
+        report_done('K', "fail", "先にゼロ点校正としきい値校正をしてください");
+        return;
+    }
+    if (ref < REFERENCE_MIN_F || ref > REFERENCE_MAX_F) {
+        report_done('K', "fail", "基準コンデンサは %.0f〜%.0f nF にしてください", REFERENCE_MIN_F * 1e9,
+                    REFERENCE_MAX_F * 1e9);
+        return;
+    }
+    printf("基準コンデンサ校正中...\n");
+
+    const auto c_lo = average_lo_for_calibration('K', "基準コンデンサ校正", "基準コンデンサを挿してください");
+    if (!c_lo) return;
+    if (std::fabs(*c_lo / ref - 1) > REFERENCE_TOLERANCE) {
+        report_done('K', "fail", "挿してあるコンデンサ (%.3f nF) と入力した値 (%.3f nF) が合いません", *c_lo * 1e9,
+                    ref * 1e9);
+        return;
+    }
+    const double new_r_lo = r_lo * *c_lo / ref;
+
+    double new_r_hi = r_hi, new_gain = hi_gain;
+    const bool with_hi = ref >= CROSS_MIN_F;
+    if (with_hi) {
+        const auto c_hi = average_hi_raw_for_calibration('K', "基準コンデンサ校正");
+        if (!c_hi) return;
+        new_r_hi = r_hi * *c_hi / ref;
+        new_gain = 1.0;
+    } else {
+        // 高容量レンジは測れないので、今の「低容量レンジとの揃い方」を保つ
+        new_gain = hi_gain * ref / *c_lo;
+    }
+    if (!plausible_r_lo(new_r_lo) || !plausible_r_hi(new_r_hi) || !plausible_hi_gain(new_gain)) {
+        report_done('K', "fail", "計算した抵抗値が範囲外です (1MΩ側 %.1f kΩ / 10kΩ側 %.3f kΩ)", new_r_lo / 1e3,
+                    new_r_hi / 1e3);
+        return;
+    }
+    r_lo = new_r_lo;
+    r_hi = new_r_hi;
+    hi_gain = new_gain;
+    cal_done |= CAL_DONE_REFERENCE | (with_hi ? CAL_DONE_CROSS : 0);
+    save_calibration();
+    report_done('K', "ok", "基準 %.3f nF: 抵抗値 %.1f kΩ / %.3f kΩ%s", ref * 1e9, r_lo / 1e3, r_hi / 1e3,
+                with_hi ? "" : " (10kΩ側は 30nF 以上の基準で決まります)");
+}
+
 void print_capacitance(std::optional<double> c, const char *range, const char *range_key) {
     if (c) {
         printf("#meas,%s,%.6e\n", range_key, *c);
@@ -617,8 +710,8 @@ void print_capacitance(std::optional<double> c, const char *range, const char *r
 }
 
 void print_status() {
-    printf("しきい値: %.4f × VDD / 浮遊容量: %.2f pF / 高容量レンジ補正: %.4f\n", vth_ratio,
-           charge_time_to_capacitance_lo(stray_t) * 1e12, hi_gain);
+    printf("しきい値: %.4f × VDD / 浮遊容量: %.2f pF / 高容量レンジ補正: %.4f / 抵抗: %.1f kΩ, %.3f kΩ\n", vth_ratio,
+           charge_time_to_capacitance_lo(stray_t) * 1e12, hi_gain, r_lo / 1e3, r_hi / 1e3);
     report_calibration();
 }
 
@@ -676,6 +769,8 @@ int main() {
             case 'c': report_state("cal_threshold"); calibrate_threshold(); break;
             case 'x': report_state("cal_cross"); calibrate_cross(); break;
             case 'i': print_status(); break;
+            case 'R': set_resistors(); break;
+            case 'K': report_state("cal_reference"); calibrate_reference(); break;
             case '?': print_help(); break;
             default: break;
         }
